@@ -1,0 +1,539 @@
+---
+title: "Proyecto estadistica con econometria"
+author: "Francisco Vázquez Mendoza, Noé Ramirez, Carlos Ramírez"
+format: html
+editor: visual
+jupyter: python3
+---
+
+# 1. Introducción y Conexión con el Proyecto Anterior
+
+Nuestra nueva hipótesis es que la **ubicación** y la **seguridad** son igual de importantes. Si ignoramos estos factores, nuestro modelo anterior podría estar equivocado (sesgado). Por eso, en este segundo avance, vamos a desafiar nuestro propio modelo agregando la distancia a los centros de empleo y la tasa de criminalidad.
+
+## 2. Modelo Base y diagnostico
+
+```{r}
+data("hprice2", package = "wooldridge")
+```
+
+```{r}
+model <- lm(price ~ rooms, data = hprice2)
+summary(model)
+```
+
+Prueba de Park
+
+```{r}
+residuos_sq <- residuals(model)^2
+log_residuos_sq <- log(residuos_sq)
+
+log_rooms <- log(hprice2$rooms)
+
+model_park <- lm(log_residuos_sq ~ log_rooms)
+
+summary(model_park)
+```
+
+Jarque bera
+
+```{r}
+library(tseries)
+jarque.bera.test(residuals(model))
+```
+
+```{r}
+library(ggplot2)
+ggplot(hprice2, aes(x = rooms, y = price)) +
+  geom_point(alpha = 0.6) +  # Corregido: 'alpha' debe estar entre 0 y 1
+  geom_smooth(method = "lm", se = FALSE, color = "blue") + 
+  labs(title = "Regresión Lineal: Precio vs. Cuartos",
+       x = "Número de Cuartos", y = "Precio de la Vivienda") +
+  theme_minimal()
+```
+
+```{r}
+hprice2$lrooms <- log(hprice2$rooms)
+model_loglog <- lm(lprice ~ lrooms, data = hprice2)
+summary(model_loglog)
+```
+
+```{r}
+residuos_ll_sq <- residuals(model_loglog)^2
+log_residuos_ll_sq <- log(residuos_ll_sq)
+
+model_park_ll <- lm(log_residuos_ll_sq ~ lrooms, data = hprice2)
+
+summary(model_park_ll)
+```
+
+```{r}
+jarque.bera.test(residuals(model_loglog))
+```
+
+Es necesario expandir el análisis incorporando la **distancia** y el **crimen** para determinar si la ubicación y la seguridad son factores igual de críticos que la estructura física.
+
+## 3. Problema de la distancia
+
+Dado que ya vimos que el modelo **Log-Log** funciona mejor para `price` y `rooms`, lo más coherente es aplicar logaritmo también a `dist`. Así tendrremos un modelo de **elasticidades constantes**.
+
+$$\log(\text{price}) = \beta_0 + \beta_1 \log(\text{rooms}) + \beta_2 \log(\text{dist}) + u$$
+
+```{r}
+
+hprice2$ldist <- log(hprice2$dist)
+
+model_mult <- lm(lprice ~ lrooms + ldist, data = hprice2)
+
+summary(model_mult)
+```
+
+Para nosotros, creemos que pagar *más* por vivir *cerca* del trabajo (lo que implicaría un signo negativo). Pero nos salió **positivo**(0.19149), osea nos dice que **la gente paga más por vivir más lejos** de los centros de empleo, lo cual no tiene nada de sentido
+
+Hacemos la prueba RESET de Ramsey porque el resultado de la distancia ("lejos es más caro") nos hace sospechar que el modelo está **mal especificado**
+
+```{r}
+
+library(lmtest)
+resettest(model_mult, power = 2:3, type = "fitted")
+```
+
+El P-value es muy menor al nivel de significancia por lo que decidimos agregarle más variables
+
+Agregaremos la variable crime, para ver si la seguridad afecta al precio
+
+```{r}
+hprice2$lcrime <- log(hprice2$crime)
+model_crime <- lm(lprice ~ lrooms + ldist + lcrime, data = hprice2)
+
+summary(model_crime)
+```
+
+Al controlar por el crimen, la distancia ahora tiene el signo económico correcto: vivir más lejos del centro tiende a disminuir el precio.
+
+La inseguridad castiga el precio. Por cada **1% que aumenta la criminalidad**, el precio de la vivienda **cae aproximadamente un 0.09%**,
+
+es necesario someterlo nuevamente a pruebas de diagnóstico.
+
+```{r}
+library(lmtest)
+resettest(model_crime, power = 2:3, type = "fitted")
+```
+
+Aunque mejoramos los signos, la prueba RESET sigue indicando que el modelo no es perfecto.
+
+```{r}
+
+log_u2_crime <- log(residuals(model_crime)^2)
+
+park_test_crime <- lm(log_u2_crime ~ fitted(model_crime))
+
+summary(park_test_crime)
+```
+
+Aunque la inclusión de la variable criminalidad corrigió el sesgo de los coeficientes (signos correctos), la Prueba de Park arroja un p-valor significativo ($< 0.05$). Esto indica que **persiste la heterocedasticidad**
+
+Interpretamos el fallo en la prueba de Park no como un error del modelo, sino como un **indicio** de que la varianza del precio no es constante porque el mercado se comporta de forma distinta en diferentes zonas.
+
+Esto plantea una interrogante crítica para la investigación: **¿El precio de las casas se comporta igual en zonas seguras que en zonas peligrosas?**
+
+```{r}
+library(strucchange)
+
+hprice2_ordenada <- hprice2[order(hprice2$crime), ]
+
+
+punto_quiebre <- floor(nrow(hprice2_ordenada) / 2)
+
+sctest(lprice ~ lrooms + ldist + lcrime, 
+       data = hprice2_ordenada, 
+       type = "Chow", 
+       point = punto_quiebre)
+```
+
+Como el $p$-valor es muchísimo menor a $0.05$, **rechazamos la Hipótesis Nula (**$H_0$).
+
+-   El modelo **NO es estable**.
+
+-   Esto confirma que el mercado inmobiliario se comporta de forma **distinta** en zonas de baja criminalidad comparado con zonas de alta criminalidad.
+
+Ahora empieza la comparación de nuestros modelos MODELOS AIC Y ACI El AIC es un criterio de selección de modelos que ayuda a encontrar el modelo que mejor ajusta a los datos con la menor cantidad de variables posibles
+
+Modelo simple
+
+```{r}
+model_simple <- lm(lprice ~ lrooms, data = hprice2)
+summary(model_simple)
+```
+
+Función ACI
+
+```{r}
+
+ACI <- function(model, data_base, k){
+  n <- dim(data_base)[1]
+  SCR <- sum(residuals(model)^2)
+  return(2*k/n + log(SCR/n))
+}
+```
+
+Cálculo de AIC
+
+```{r}
+# k=1 variable
+aic_simple <- ACI(model_simple, hprice2, 1)
+aic_simple
+```
+
+Aqui utilizamos este numero para comparar ya que no sabemos si es bueno o malo
+
+```{r}
+# modelo 2
+model_completo <- lm(lprice ~ lrooms + ldist + lcrime, data = hprice2)
+summary(model_completo)
+```
+
+```{r}
+# k=3 variables
+aic_completo <- ACI(model_completo, hprice2, 3)
+aic_completo
+```
+
+**"mientras más negativo (menor), mejor"**.
+
+agregar el crimen y la distancia hizo que el modelo fuera significativamente mejor
+
+nuestros modelos han asumido una relación lineal, lo que implica que el valor agregado por una habitación adicional es constante, sin importar el tamaño de la casa. pero ahora nos interrogamos
+
+¿Una habitación extra vale lo mismo si tienes 2 cuartos que si tienes 10? Probablemente no.
+
+```{r}
+model_cuadratico <- lm(lprice ~ lrooms + I(lrooms^2) + ldist + lcrime, data = hprice2)
+summary(model_cuadratico)
+```
+
+Rechazamos contundentemente la hipótesis de linealidad. La relación entre el precio y las habitaciones **NO es una línea recta**. Intentar modelarlo como tal (como hicimos al principio) era un error de especificación
+
+```{r}
+cat("Diferencia AIC:", aic_simple - aic_completo)
+```
+
+Sin embargo, que un modelo sea el "mejor" en términos globales no garantiza que funcione igual de bien en todos los datos de la muestra. Dado que la criminalidad es una variable con fuerte impacto, sospechamos que el modelo podría volverse inestable en los vecindarios más peligrosos.
+
+CUSUM
+
+la prueba CUSUM nos permite monitorear la evolución de los coeficientes a medida que nos desplazamos desde los vecindarios más seguros hacia los más peligrosos.
+
+```{r}
+# Ordenamos datos por crimen para la prueba de estabilidad
+hprice2_ordenada <- hprice2[order(hprice2$crime), ]
+```
+
+```{r}
+ef_cusum <- efp(lprice ~ lrooms + ldist + lcrime, 
+                data = hprice2_ordenada, 
+                type = "Rec-CUSUM")
+```
+
+```{r}
+plot(ef_cusum, main = "Prueba CUSUM (Residuos Recursivos)")
+```
+
+El gráfico muestra claramente la inestabilidad del modelo. Observamos que, en el 80% inicial de la muestra (correspondiente a zonas de baja y media criminalidad), el proceso de residuos (línea negra) se mantiene estable dentro de las bandas de confianza (líneas rojas). Sin embargo, en el último tramo (eje X \> 0.8), que corresponde a las **zonas de alta criminalidad**, la línea negra desciende bruscamente y **cruza la banda de confianza inferior**.
+
+**Significado:** Esto confirma visualmente que el modelo sufre un **quiebre estructural**. Las reglas de valoración de la vivienda cambian drásticamente en los vecindarios más peligrosos, haciendo que nuestro modelo general pierda capacidad predictiva en ese segmento específico.
+
+```{r}
+
+library(MTS)
+
+
+y_rls <- hprice2_ordenada$lprice
+
+x_rls <- as.matrix(hprice2_ordenada[, c("lrooms", "ldist", "lcrime")])
+
+x_rls <- cbind(1, x_rls) 
+
+
+res_rls <- MTS::RLS(x_rls, y_rls)
+
+# 3. Graficar los residuos
+resi_t <- res_rls$resi
+plot(resi_t, 
+     type = "l", 
+     ylab = "Residuo", 
+     xlab = "Índice (Ordenado por Crimen)", 
+     main = "Residuos RLS")
+abline(h = 0, col = "red", lty = 2) # Línea roja de referencia
+```
+
+Te dice que tu modelo es preciso en barrios seguros, pero se vuelve "loco" e impredecible en barrios peligrosos.
+
+Para incluir los ultimos temas del semestre incluimos una nueva hipotesis ¿Qué probabilidad hay de que sea una casa de **clase alta**?
+
+```{r}
+mediana_precio <- median(hprice2$price)
+hprice2$casa_cara <- ifelse(hprice2$price > mediana_precio, 1, 0)
+
+
+table(hprice2$casa_cara)
+
+
+model_probit <- glm(casa_cara ~ lrooms + ldist + lcrime, 
+                    family = binomial(link = "probit"), 
+                    data = hprice2)
+
+
+model_logit <- glm(casa_cara ~ lrooms + ldist + lcrime, 
+                   family = binomial(link = "logit"), 
+                   data = hprice2)
+
+# 4. Ver los Resultados
+summary(model_probit)
+summary(model_logit)
+```
+
+Cuartos
+
+Coeficiente positivo y muy significativo ($p < 2e-16$)
+
+Aumentar el número de habitaciones dispara la probabilidad de que la casa sea clasificada como "Clase Alta".
+
+El Efecto del Crimen
+
+-   Coeficiente negativo y significativo.
+
+-   **Significado:** A mayor criminalidad, la probabilidad de ser una casa de alto valor se desploma.
+
+Distancia
+
+Ambos son mayores a 0.05. Esto confirma nuevamente que, para determinar si una casa es "rica" o no, la distancia al trabajo **no importa**. Solo importan el tamaño y la seguridad.
+
+# Aplicacion de la materia de estadistica aplicada
+
+Preparación y Distribución Bernoulli
+
+```{r}
+# --- SECCIÓN 1: DISTRIBUCIÓN BERNOULLI (VARIABLE BINARIA) ---
+library(wooldridge)
+library(dplyr)
+library(ggplot2)
+library(kableExtra)
+
+# 1.1 Cargar datos y crear variable Bernoulli
+data("hprice2")
+mediana_precio <- median(hprice2$price)
+# Definimos "Éxito" (1) si la casa es de clase alta (precio > mediana)
+hprice2$casa_cara <- ifelse(hprice2$price > mediana_precio, 1, 0)
+
+# 1.2 Cálculo de Parámetros
+p_real <- mean(hprice2$casa_cara)      # Probabilidad de éxito (p)
+var_obs <- var(hprice2$casa_cara)      # Varianza observada en los datos
+var_teo <- p_real * (1 - p_real)       # Varianza teórica Bernoulli
+
+# 1.3 Reporte de Resultados
+cat("--- ANÁLISIS BERNOULLI ---\n")
+cat("Probabilidad de encontrar una casa cara (p):", round(p_real, 4), "\n")
+cat("Varianza Observada en Boston:", round(var_obs, 4), "\n")
+cat("Varianza Teórica p(1-p):", round(var_teo, 4), "\n")
+cat("Conclusión: Los datos validan la propiedad teórica de la varianza Bernoulli.\n")
+
+
+```
+
+### Distribución Binomial (Simulación de Muestreo)
+
+Usar el parámetro $p$ calculado arriba para modelar un escenario de muestreo, aplicando la teoría de la Distribución Binomial $Bin(n, p)$
+
+Si un agente selecciona 10 casas al azar, ¿cuál es la probabilidad de que exactamente 4 sean de clase alta?
+
+```{r}
+# --- SECCIÓN 2: APLICACIÓN BINOMIAL (MUESTREO DE CASAS) ---
+
+# 2.1 Definición del Experimento
+n_muestra <- 10        # Número de ensayos (casas mostradas)
+k_exitos <- 0:10       # Posibles resultados (0 a 10 casas caras)
+
+# 2.2 Cálculo de Probabilidades Teóricas (usando p real de Boston)
+probs_binom <- dbinom(k_exitos, size = n_muestra, prob = p_real)
+
+# 2.3 Visualización de la Distribución
+datos_binom <- data.frame(Exitos = k_exitos, Probabilidad = probs_binom)
+
+ggplot(datos_binom, aes(x = Exitos, y = Probabilidad)) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  geom_text(aes(label = round(Probabilidad, 3)), vjust = -0.5) +
+  labs(title = paste("Distribución Binomial: Muestra de", n_muestra, "casas"),
+       subtitle = paste("Probabilidad de éxito p =", round(p_real, 2), "(basada en datos reales)"),
+       x = "Número de Casas de Clase Alta encontradas",
+       y = "Probabilidad") +
+  theme_minimal()
+```
+
+-   **Mercado Equilibrado:** Con una probabilidad de éxito $p=0.49$, el mercado se divide casi perfectamente 50/50 entre casas de "clase alta" y estándar.
+
+-   **Resultado Esperado:** Al revisar 10 casas al azar, lo más probable (25%) es que encuentres exactamente **5 de clase alta**.
+
+-   **Sin Extremos:** Es casi imposible (0.1% de probabilidad) encontrar una zona donde **todas** o **ninguna** de las casas sean de clase alta por puro azar; la mezcla es la norma.
+
+Distribución Poisson (Conteo de Habitaciones)
+
+Analizar si el número de habitaciones (`rooms`) sigue una distribución de Poisson, ideal para conteos.
+
+```{r}
+# --- SECCIÓN 3: DISTRIBUCIÓN POISSON (CONTEOS) ---
+
+# 3.1 Preparación de la variable de conteo
+# Poisson requiere enteros, redondeamos las habitaciones promedio
+hprice2$rooms_int <- round(hprice2$rooms)
+
+# 3.2 Cálculo de Lambda y Validación de Supuestos
+lambda_rooms <- mean(hprice2$rooms_int)
+var_rooms <- var(hprice2$rooms_int)
+
+cat("--- ANÁLISIS POISSON (HABITACIONES) ---\n")
+cat("Lambda estimada (promedio):", round(lambda_rooms, 4), "\n")
+cat("Varianza observada:", round(var_rooms, 4), "\n")
+
+# 3.3 Comparación Visual: Real vs Teórica
+# Generamos una Poisson teórica con el mismo lambda para comparar
+set.seed(123)
+sim_poisson <- rpois(nrow(hprice2), lambda_rooms)
+
+datos_comp <- data.frame(
+  Habitaciones = c(hprice2$rooms_int, sim_poisson),
+  Origen = rep(c("Datos Reales (Boston)", "Teórica Poisson"), each = nrow(hprice2))
+)
+
+ggplot(datos_comp, aes(x = Habitaciones, fill = Origen)) +
+  geom_histogram(binwidth = 1, alpha = 0.6, position = "identity", color = "black") +
+  scale_fill_manual(values = c("blue", "red")) +
+  labs(title = "Bondad de Ajuste: Distribución de Habitaciones vs Poisson",
+       subtitle = "Comparando la estructura de las casas de Boston con el modelo teórico",
+       x = "Número de Habitaciones", y = "Frecuencia") +
+  theme_minimal()
+```
+
+-   **Falta de Ajuste:** La distribución de Poisson (roja) **no es un buen modelo** para explicar el número de habitaciones. La teoría predice mucha más variedad (dispersión) de la que realmente existe.
+
+-   **Mercado Estandarizado:** Los datos reales (azules) muestran una concentración extrema entre **6 y 7 habitaciones**. El mercado inmobiliario de Boston es mucho más rígido y estandarizado de lo que sugeriría el azar.
+
+-   **Subdispersión:** Existe una clara **"subdispersión"**. A diferencia de la teoría Poisson (donde media = varianza), aquí la varianza real es mucho menor; es muy raro encontrar casas fuera del promedio (muy chicas o muy grandes).
+
+Distribución Geométrica (Tiempo de Espera)
+
+¿Cuántas casas 'baratas' (fracasos) tiene que visitar un comprador antes de encontrar la primera casa 'cara' (éxito)?
+
+```{r}
+# --- SECCIÓN 4: DISTRIBUCIÓN GEOMÉTRICA (TIEMPO DE ESPERA) ---
+
+# 4.1 Cálculo de la Esperanza Teórica
+# E(X) = (1-p)/p : Número esperado de fallos antes del primer éxito
+esperanza_geo <- (1 - p_real) / p_real
+
+cat("--- TIEMPO DE BÚSQUEDA (GEOMÉTRICA) ---\n")
+cat("Probabilidad de éxito (p):", round(p_real, 4), "\n")
+cat("Número esperado de casas 'descartadas' antes de encontrar la ideal:", round(esperanza_geo, 2), "\n")
+
+# 4.2 Simulación del Proceso de Búsqueda
+# Simulamos a 1000 compradores buscando casa en este mercado
+set.seed(456)
+busquedas <- rgeom(1000, prob = p_real)
+
+# Gráfico de la simulación
+hist(busquedas, breaks = 15, col = "lightgreen", border = "white",
+     main = "Simulación: ¿Cuánto tarda un cliente en encontrar casa cara?",
+     xlab = "Número de casas visitadas sin éxito", ylab = "Frecuencia de Clientes")
+abline(v = esperanza_geo, col = "red", lwd = 3, lty = 2)
+text(esperanza_geo, 200, paste("Media Teórica =", round(esperanza_geo, 1)), pos = 4, col = "red")
+```
+
+**Éxito Inmediato:** Lo más común (la barra enorme en el 0) es tener suerte a la primera. La mayoría de los clientes encuentran una casa de clase alta sin tener que descartar ninguna antes.
+
+-   **Búsqueda Rápida:** El promedio es **1**. Esto significa que, típicamente, un cliente solo ve **una casa incorrecta** antes de encontrar la ideal.
+
+-   **Sin Frustración:** Es rarísimo tener una "mala racha". Casi nadie tiene que visitar más de 4 casas para encontrar una de clase alta, lo que indica un mercado con mucha oferta disponible.
+
+### Teorema Central del Límite (Normalidad de Precios)
+
+Demostrar que, aunque el precio no sea normal, el **promedio** de los precios de muchas muestras sí se distribuye normal, validando el TCL.
+
+```{r}
+# --- SECCIÓN 5: TEOREMA CENTRAL DEL LÍMITE (PRECIOS) ---
+
+# 5.1 Configuración del Experimento
+n_muestra <- 30       # Tamaño de cada muestra
+k_replicas <- 1000    # Número de veces que repetimos el muestreo
+
+# 5.2 Generación de Medias Muestrales
+set.seed(789)
+medias_precios <- replicate(k_replicas, {
+  muestra <- sample(hprice2$price, n_muestra, replace = TRUE)
+  mean(muestra)
+})
+
+# 5.3 Visualización de la Convergencia Normal
+datos_tcl <- data.frame(Medias = medias_precios)
+
+ggplot(datos_tcl, aes(x = Medias)) +
+  geom_histogram(aes(y = ..density..), bins = 30, fill = "purple", alpha = 0.5, color="white") +
+  geom_density(color = "darkblue", size = 1.2) +
+  labs(title = "Validación del Teorema Central del Límite",
+       subtitle = "Distribución de las medias muestrales del precio (n=30)",
+       x = "Precio Promedio de la Muestra",
+       y = "Densidad") +
+  theme_minimal()
+```
+
+**Gráfico Binomial (Muestreo):** El mercado es un "cara o cruz" (50/50). Si visitas 10 casas, lo normal es ver una mezcla equilibrada; es casi imposible encontrar zonas "puras" de un solo tipo por azar.
+
+-   **Gráfico Poisson (Habitaciones):** La realidad es más rígida que la teoría. Mientras la estadística espera variedad de tamaños, en Boston casi todas las casas se estancaron en 6 o 7 cuartos.
+
+-   **Gráfico TCL (Promedios):** El caos individual crea orden colectivo. Aunque el precio de una casa suelta sea impredecible, el precio promedio del mercado es un dato "roca sólida" y totalmente confiable para tomar decisiones.
+
+### 
+
+Evaluación de Clasificación (Curva ROC)
+
+Evaluar la capacidad estadística para distinguir entre una casa de clase alta y una estándar. Usaremos la Curva ROC (Receiver Operating Characteristic), que contrasta la **Sensibilidad** (capacidad de detectar casas caras) frente a la **Especificidad** (capacidad de descartar casas baratas).
+
+```{r}
+# --- SECCIÓN 6: CURVA ROC (CAPACIDAD DISCRIMINANTE) ---
+library(pROC)
+
+# 6.1 Generación de Probabilidades (Modelo Probabilístico Simple)
+# Ajustamos un modelo Logit simple para obtener una "probabilidad de ser cara"
+# basada en el número de cuartos y la criminalidad.
+modelo_prob <- glm(casa_cara ~ rooms + crime, family = binomial, data = hprice2)
+probabilidades <- predict(modelo_prob, type = "response")
+
+# 6.2 Cálculo de la Curva ROC [cite: 91, 107]
+roc_obj <- roc(hprice2$casa_cara, probabilidades, 
+               plot = TRUE,               # Generar gráfico automático
+               print.auc = TRUE,          # Mostrar el valor del área
+               col = "darkblue",          # Color de la línea
+               lwd = 3,                   # Grosor de línea
+               legacy.axes = TRUE,        # Ejes clásicos (1-Especif vs Sensib)
+               main = "Curva ROC: Detección de Casas de Clase Alta",
+               xlab = "Tasa de Falsos Positivos (1 - Especificidad)",
+               ylab = "Tasa de Verdaderos Positivos (Sensibilidad)")
+
+# 6.3 Interpretación del Área Bajo la Curva (AUC)
+auc_valor <- auc(roc_obj)
+
+cat("--- RESULTADOS ROC ---\n")
+cat("Área Bajo la Curva (AUC):", round(auc_valor, 4), "\n")
+
+if(auc_valor > 0.9) {
+  cat("Conclusión: Excelente discriminación. Las variables separan casi perfectamente las clases.\n")
+} else if(auc_valor > 0.8) {
+  cat("Conclusión: Buena discriminación. El modelo es útil para clasificar.\n")
+} else {
+  cat("Conclusión: Discriminación pobre. Es difícil distinguir las casas solo con estas variables.\n")
+}
+```
+
+-   **Variables Definitivas:** Esto confirma que el número de habitaciones y la seguridad no son detalles menores; son los factores **definitivos** que dividen al mercado de Boston en dos mundos distintos.
+
+-   Es capaz de distinguir correctamente entre una casa cara y una barata casi el **89%** de las veces
+
+    **Predicción Segura:** La forma de la curva indica que el modelo detecta la gran mayoría de las casas de lujo cometiendo **muy pocos errores** (falsos positivos)
