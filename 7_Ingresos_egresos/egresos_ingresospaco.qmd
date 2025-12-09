@@ -1,0 +1,1261 @@
+---
+title: "Análisis Estadístico de las Finanzas Públicas Estatales en México"
+subtitle: "Estadística de Finanzas Públicas Estatales y Municipales (EFIPEM) 2013-2023"
+format: 
+  html:
+    grid: 
+      body-width: 1000px
+editor: visual
+---
+
+```{=html}
+<style>
+main.content {
+text-align: justify}
+</style>
+```
+
+```{r}
+#| code-fold: true
+#| message: false
+#| warning: false
+
+library(tidyverse)
+library(RColorBrewer)
+library(sf)          # Para datos espaciales
+library(viridis)     # Para paletas de colores
+library(DT)
+library(plotly)
+library(knitr)
+library(kableExtra)
+library(corrplot)
+library(broom)
+library(scales)
+library(multcomp)
+```
+
+# Introducción
+
+## Marco Conceptual de la EFIPEM
+
+La **Estadística de Finanzas Públicas Estatales y Municipales (EFIPEM)** es un proyecto estadístico del Instituto Nacional de Estadística y Geografía (INEGI) que tiene como objetivo integrar información sobre el origen y aplicación de los recursos financieros de los gobiernos estatales y municipales en México. A continuación se hace una descripción de la estructura de los datos brindada en la [Síntesis metodológica de la estadística de finanzas públicas estatales y municipales](https://www.inegi.org.mx/app/biblioteca/ficha.html?upc=702825085926).
+
+### Estructura de Clasificación de los Datos
+
+La EFIPEM organiza la información financiera siguiendo una estructura jerárquica que permite un análisis detallado y homogéneo de las finanzas públicas:
+
+#### Niveles de Agregación
+
+1.  **Tema**: Nivel más agregado que clasifica las operaciones en:
+
+    -   **Ingresos**: Recursos captados por las entidades públicas
+    -   **Egresos**: Recursos aplicados por las entidades públicas
+
+2.  **Capítulo**: Cada tema se divide en 11 capítulos que agrupan operaciones de naturaleza similar
+
+3.  **Concepto**: Subdivisión de los capítulos que especifica el tipo de operación
+
+4.  **Partida**: Nivel de detalle que identifica el objeto específico del ingreso o gasto
+
+5.  **Subpartida**: Mayor nivel de desagregación disponible
+
+#### Marco Normativo
+
+La EFIPEM se fundamenta en:
+
+-   **Recomendaciones Internacionales**: Manual de Estadísticas de Finanzas Públicas del FMI (2014)
+-   **Normatividad Nacional**: Ley General de Contabilidad Gubernamental
+-   **Clasificadores**: Catálogos del Consejo Nacional de Armonización Contable (CONAC)
+
+### Objetivos del Análisis
+
+El presente estudio tiene como objetivos:
+
+1.  **Analizar la evolución de los ingresos y egresos estatales** durante el período 2013-2023
+2.  **Identificar patrones y tendencias** en las finanzas públicas estatales
+3.  **Realizar análisis estadísticos descriptivos** a nivel de tema
+4.  **Aplicar pruebas de hipótesis** para evaluar diferencias significativas
+5.  **Proporcionar hallazgos** sobre la gestión financiera estatal en México
+
+# Cargar datos
+
+Consideramos los datos de finanzas públicas de los estados de México, disponibles en varios archivos CSV dentro de la carpeta "conjunto_de_datos". No se consideran los valores de la Ciudad de México.
+
+```{r}
+#| code-fold: true
+#| message: false
+#| warning: false
+
+
+# Se identifican los archivos CSV en el directorio especificado
+data_sets <- list.files("./conjunto_de_datos", pattern = "*.csv", full.names = TRUE)
+
+# Se leen y combinan los archivos CSV en un solo data frame
+datos <- data_sets |> 
+  set_names(nm = data_sets) |> 
+  map_dfr(read_csv, .id = "source_file")
+
+# Convertir variables de tipo character a factor
+datos_factor <- datos |> 
+  dplyr::select(where(is.character)) |> 
+  names()
+
+datos <- datos |> 
+  mutate(across(all_of(datos_factor), as_factor))
+
+# Crear variables adicionales
+datos <- datos |> mutate(ANIO_factor = as_factor(ANIO), VALOR_millones = VALOR / 1e6)
+datos <- datos |> rename(CVE_ENT = ID_ENTIDAD)
+
+# Cargar datos de estados y unir con el conjunto de datos principal
+datos_estado <- read_csv("tc_entidad.csv")
+datos_estado <- datos_estado |> mutate(across(everything(), as_factor))
+datos_estado$ZONA <- factor(datos_estado$ZONA, levels = c("NORTE", "CENTRO", "SUR"))
+
+datos <- left_join(datos, datos_estado)
+
+# Eliminar columnas no necesarias
+datos <- datos |> dplyr::select(-source_file, -PROD_EST, -COBERTURA, -ESTATUS) 
+
+#glimpse(datos)
+
+nacional_estado <- st_read("data_nacional/00ent.shp", options = "ENCODING=LATIN1", quiet = TRUE)
+nacional_estado <- left_join(nacional_estado, datos_estado, by = "CVE_ENT")
+
+cat("Años disponibles:", paste(unique(datos$ANIO_factor), collapse = ", "), "\n")
+cat("Entidades incluidas:", length(unique(datos$CVE_ENT)), "\n")
+cat("Temas:", paste(unique(datos$TEMA), collapse = ", "), "\n")
+cat("Categorías:", paste(unique(datos$CATEGORIA), collapse = ", "), "\n\n")
+
+```
+
+# Análisis Exploratorio de Datos
+
+## Estructura General de los Datos
+
+```{r}
+#| code-fold: true
+# Tabla resumen
+resumen_estructura <- datos |> group_by(TEMA, CATEGORIA) |> 
+  summarise(
+    registros = n(),
+    entidades_distintas = n_distinct(CVE_ENT),
+    valor_total = sum(VALOR, na.rm = TRUE)/ 1e9,  # En miles de millones
+    .groups = "drop"
+  ) |> 
+  arrange(TEMA, CATEGORIA)
+
+kable(resumen_estructura, 
+      col.names = c("Tema", "Categoría", "Registros", "Entidades", "Total (Miles Mill. MXN)"),
+      digits = 2,
+      caption = "Estructura General de los Datos EFIPEM 2014-2023") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+<br>
+
+## Análisis a Nivel de Tema
+
+### Series temporales de egresos e ingresos por estado
+
+```{r}
+#| code-fold: true
+
+# Filtrar solo datos a nivel Tema
+datos_tema <- datos |> filter(CATEGORIA == "Tema") |> 
+  dplyr::select(ANIO, ANIO_factor, CVE_ENT, NOM_ENT, ABR_ENT, TEMA, VALOR)  |> 
+  pivot_wider(names_from = TEMA, values_from = VALOR, values_fill = 0) |> 
+  mutate(
+    total_operaciones = Ingresos + Egresos,
+    balance = Ingresos - Egresos,
+    balance_porcentual = (balance / Ingresos) * 100
+  )
+```
+
+Dado que los temas principales, ingresos y egresos, están en balance a continuación se brinda la gráfica de tales valores a los largo del periodo 2013-2023.
+
+```{r}
+#| code-fold: true
+
+
+datos_tema <- datos_tema |> dplyr::mutate(VALOR = Egresos, VALOR_millones = VALOR / 1e6)
+
+datos_tema <- datos_tema |> dplyr::select(ANIO:ABR_ENT, VALOR, VALOR_millones)
+datos_tema <- left_join(datos_tema, datos_estado |> dplyr::select(CVE_ENT, ZONA), by = "CVE_ENT")
+
+graf_egresos_ingresos <- ggplot(datos_tema, aes(x = ANIO, y = VALOR / 1e9, group = ABR_ENT, color = ABR_ENT)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  labs(
+    title = "Evolución de Egresos/Ingresos por Entidad (2013-2023)",
+    x = "Año",
+    y = "Egresos/Ingresos (Miles de Millones MXN)",
+    color = "Entidad"
+  ) +
+  scale_x_continuous(breaks = seq(2013, 2023, by = 1)) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.title = element_text(size = 12),
+    legend.position = "bottom"
+  )
+
+ggplotly(graf_egresos_ingresos)
+```
+
+### Estadísticas descriptivas por estado
+
+```{r estadisticas-por-estado}
+#| code-fold: true
+
+
+# Calcular estadísticas descriptivas por estado
+estadisticas_estados <- datos_tema |> 
+  group_by(CVE_ENT, NOM_ENT, ABR_ENT)  |> 
+  summarise(
+    observaciones = n(),
+    media_valor = mean(VALOR_millones, na.rm = TRUE),
+    mediana_valor = median(VALOR_millones, na.rm = TRUE),
+    desviacion_valor = sd(VALOR_millones, na.rm = TRUE),
+    coef_valor = sd(VALOR_millones, na.rm = TRUE) / abs(mean(VALOR_millones, na.rm = TRUE)),
+    valor_min = min(VALOR_millones, na.rm = TRUE),
+    valor_max = max(VALOR_millones, na.rm = TRUE),
+    q_75 = quantile(VALOR_millones, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  ) 
+
+# Tabla completa de estadísticas por estado
+kable(estadisticas_estados,
+      col.names = c("CVE", "Entidad Federativa", "Abreviatura", "Obs.", "Media", "Mediana", 
+                   "Desv. Est.", "Coef. Var.", "Mín.", "Máx.", "3er. cuartil"),
+      digits = 3,
+      caption = "Estadísticas Descriptivas de Egresos/Ingresos (en millones MXN) por Estado (2013-2023)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), 
+                font_size = 11) %>%
+  scroll_box(height = "500px")
+```
+
+<br>
+
+### Mapa de egresos/ingresos promedio por estado
+
+```{r}
+#| code-fold: true
+#| fig-width: 8
+#| fig-height: 6
+#| fig-align: "center"
+
+estadisticas_estados_mapa <- estadisticas_estados |> 
+  dplyr::select(CVE_ENT, media_valor)
+estadisticas_estados_mapa <- left_join(nacional_estado, estadisticas_estados_mapa, by = "CVE_ENT")
+
+
+mapa <- ggplot(estadisticas_estados_mapa) +
+  geom_sf(aes(fill=media_valor), color = "gray50", size = 0.5) +
+  labs(
+    title = "Egresos/Ingresos promedio por estado (2013-2023)",
+    subtitle = "Valores en millones de MXN",
+    caption = "Fuente: INEGI - Finanzas Públicas",
+    fill = " "
+  ) +
+  scale_fill_viridis_c(labels = comma) +
+  theme_void() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 12),
+    plot.caption = element_text(size = 10)
+  )
+  
+  
+print(mapa)
+```
+
+Sin el Estado de México para una mejor visualización.
+
+```{r}
+#| code-fold: true
+#| fig-width: 8
+#| fig-height: 6
+#| fig-align: "center"
+
+
+mapa <- ggplot(estadisticas_estados_mapa |> filter(ABR_ENT != "MEX")) +
+  geom_sf(aes(fill=media_valor), color = "gray50", size = 0.5) +
+  labs(
+    title = "Egresos/Ingresos promedio por estado (2013-2023)",
+    subtitle = "Valores en millones de MXN",
+    caption = "Fuente: INEGI - Finanzas Públicas",
+    fill = " "
+  ) +
+  scale_fill_viridis_c(labels = comma, breaks = c(50000, 100000, 130000)) +
+  theme_void() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 12),
+    plot.caption = element_text(size = 10)
+  )
+  
+  
+print(mapa)
+```
+
+### Análisis de varianza (ANOVA) por estado
+
+Inicialmente se muestra la distribución de los egresos/ingresos por estado por medio de gráficas de cajas.
+
+```{r}
+#| code-fold: true
+#| fig-width: 12
+#| fig-height: 6
+
+ggplot(datos_tema, aes(x = ABR_ENT, y = VALOR_millones)) +
+  geom_boxplot(aes(fill = ABR_ENT), outlier.color = "red", outlier.size = 1.5, show.legend = FALSE) +
+  labs(
+    title = "Distribución de Egresos/Ingresos por Estado (2013-2023)",
+    x = "Estado",
+    y = "Egresos/Ingresos (Millones MXN)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.title = element_text(size = 12)
+  )
+```
+
+Omitiendo el Estado de México para una mejor visualización.
+
+```{r}
+#| code-fold: true
+#| fig-width: 12
+#| fig-height: 6
+#| fig-align: "center"
+
+ggplot(datos_tema |> filter(ABR_ENT != "MEX"), aes(x = ABR_ENT, y = VALOR_millones)) +
+  geom_boxplot(aes(fill = ABR_ENT), outlier.color = "red", outlier.size = 1.5, show.legend = FALSE) +
+  labs(
+    title = "Distribución de Egresos/Ingresos por Estado (2013-2023)",
+    x = "Estado",
+    y = "Egresos/Ingresos (Millones MXN)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.title = element_text(size = 12)
+  )
+```
+
+Se realiza el análisis de varianza (ANOVA) para determinar si existen diferencias significativas en los egresos/ingresos entre los estados. También se aplica la prueba post-hoc de comparaciones múltiples de Tukey. Los resultados se muestran en el siguiente diagramas de cajas indicando los grupos obtenidos. *Nota:* Dado que en la prueba de Tukey se llevan comparaciones por pares (para los 30 estados considerados en total son 435 parejas), el análisis toma demasiado tiempo, por ello es necesario cargar los archivos RDS con los resultados.
+
+```{r}
+#| code-fold: true
+#| fig-width: 12
+#| fig-height: 6
+#| fig-align: "center"
+
+tema_estado_aov <- aov(VALOR_millones ~ ABR_ENT, data = datos_tema |> filter(ABR_ENT != "MEX"))
+#tema_estado_aov
+#summary(tema_estado_aov)
+tema_estado_tukey <- glht(tema_estado_aov, linfct = mcp(ABR_ENT = "Tukey"))
+#tema_estado_tukey_resumen <- summary(tema_estado_tukey)
+#tema_estado_tukey_labels <- cld(tema_estado_tukey)
+tema_estado_tukey_resumen <- readRDS("tema_estado_tukey_labels.rds")
+tema_estado_tukey_labels <- readRDS("tema_estado_tukey_labels.rds")
+tema_estado_labels <- as.data.frame(tema_estado_tukey_labels$mcletters$Letters)
+tema_estado_labels <- tema_estado_labels |>
+  mutate(ABR_ENT = rownames(tema_estado_labels), .before = 1) |> 
+  rename(tukey_label = `tema_estado_tukey_labels$mcletters$Letters`)
+
+# Basado en letras dominantes
+clasificacion_gasto <- function(letras) {
+  case_when(
+    str_detect(letras, "q") ~ "Muy Alto",           
+    str_detect(letras, "[jklo]") ~ "Alto",           
+    str_detect(letras, "[def]") ~ "Medio-Alto",     
+    str_detect(letras, "[ab]") ~ "Moderado"            
+  )
+}
+
+tema_estado_labels <- tema_estado_labels |> 
+  mutate(
+    clasificacion = clasificacion_gasto(tukey_label)
+  )
+
+tema_estado_labels <- left_join(tema_estado_labels, estadisticas_estados |> dplyr::select(ABR_ENT, q_75), by = "ABR_ENT")
+
+tema_estado_labels$clasificacion <- factor(tema_estado_labels$clasificacion, levels = c("Muy Alto", "Alto", "Medio-Alto", "Moderado"))
+
+
+
+
+ggplot(datos_tema |> filter(ABR_ENT != "MEX"), aes(x = ABR_ENT, y = VALOR_millones)) +
+  geom_boxplot(aes(fill = ABR_ENT), outlier.color = "red", outlier.size = 1.5, show.legend = FALSE) +
+  geom_label(data = tema_estado_labels,
+    aes(x = ABR_ENT, y = q_75, label = tukey_label),
+    color = "black", size = 5, vjust = -0.3) +
+  labs(
+    title = "Distribución de Egresos/Ingresos por Estado (2013-2023)",
+    subtitle = "Letras indican grupos estadísticamente iguales",
+    x = "Estado",
+    y = "Egresos/Ingresos (Millones MXN)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.title = element_text(size = 12)
+  )
+```
+
+A partir de la clasificación obtenida en la prueba de Tukey, se elabora un mapa que ilustra las categorías de egresos/ingresos por estado.
+
+```{r}
+#| code-fold: true
+#| fig-width: 8
+#| fig-height: 6
+#| fig-align: "center"
+
+mapa_clasificacion <- left_join(estadisticas_estados_mapa, tema_estado_labels |> dplyr::select(ABR_ENT, clasificacion), by = "ABR_ENT")
+
+
+mapa <- ggplot(mapa_clasificacion |> filter(ABR_ENT != "MEX")) +
+  geom_sf(aes(fill=clasificacion), color = "gray50", size = 0.5) +
+  labs(
+    title = "Clasificación de Egresos/Ingresos por estado (2013-2023)",
+    caption = "Fuente: INEGI - Finanzas Públicas",
+    fill = "Clasificación"
+  ) +
+  scale_fill_brewer(palette = "Set2") +
+  theme_void() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.caption = element_text(size = 10)
+  )
+
+
+print(mapa)
+```
+
+### Análisis de varianza (ANOVA) por zona geográfica
+
+Ahora se realiza un análisis similar pero considerando las zonas geográficas (NORTE, CENTRO, SUR) a las que pertenecen los estados. En el siguiente mapa se muestran las zonas geográficas consideradas (en el presente análisis se excluyen el Estado de México y la Ciudad de México).
+
+```{r}
+#| code-fold: true
+#| fig-width: 8
+#| fig-height: 6
+#| fig-align: "center"
+
+
+mapa_nacional <- ggplot(nacional_estado) +
+  geom_sf(aes(fill=ZONA), color = "gray50", size = 0.5) +
+  labs(
+    title = "Estados Unidos Mexicanos",
+    subtitle = "Zonas Geográficas",
+    caption = "Fuente: INEGI - Marco Geoestadístico"
+  ) +
+  scale_fill_manual(values = brewer.pal(n = 6, name = "Set3")[4:6]) +
+  theme_void() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 12),
+    plot.caption = element_text(size = 10)
+  )
+
+print(mapa_nacional)
+
+
+```
+
+A continuación se muestran las gráficas de cajas y densidad de los egresos/ingresos por zona geográfica.
+
+```{r}
+#| code-fold: true
+#| fig-width: 8
+#| fig-height: 6
+#| fig-align: "center"
+
+ggplot(datos_tema |> filter(ABR_ENT != "MEX")) +
+  geom_boxplot(aes(x = ZONA, y = VALOR_millones, fill = ZONA), outlier.color = "red", outlier.size = 1.5, show.legend = FALSE) +
+  labs(
+    title = "Distribución de Egresos/Ingresos por Zona Geográfica (2013-2023)",
+    x = "Zona Geográfica",
+    y = "Egresos/Ingresos (Millones MXN)"
+  ) +
+  scale_fill_manual(values = brewer.pal(n = 6, name = "Set3")[4:6]) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 13, face = "bold"),
+    axis.title = element_text(size = 12)
+  )
+
+```
+
+```{r}
+#| code-fold: true
+#| fig-width: 8
+#| fig-height: 6
+#| fig-align: "center"
+
+ggplot(datos_tema |> filter(ABR_ENT != "MEX")) +
+  geom_density(aes(x = VALOR_millones, fill = ZONA), alpha = 0.5) +
+  labs(
+    title = "Distribución de Egresos/Ingresos por Zona Geográfica (2013-2023)",
+    x = "Zona Geográfica",
+    y = "Egresos/Ingresos (Millones MXN)"
+  ) +
+  scale_fill_manual(values = brewer.pal(n = 6, name = "Set3")[1:3]) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 13, face = "bold"),
+    axis.title = element_text(size = 12)
+  )
+
+```
+
+Se realiza el análisis de varianza (ANOVA) para determinar si existen diferencias significativas en los egresos/ingresos entre las zonas geográficas. También se reaplica la prueba post-hoc de comparaciones múltiples de Tukey. Los resultados se muestran en el siguiente diagrama de cajas indicando los grupos obtenidos.
+
+```{r}
+#| code-fold: true
+
+tema_zona_aov <- aov(VALOR_millones ~ ZONA, data = datos_tema |> filter(ABR_ENT != "MEX"))
+#tema_zona_aov
+#summary(tema_zona_aov)
+tema_zona_tukey <- glht(tema_zona_aov, linfct = mcp(ZONA = "Tukey"))
+tema_zona_tukey_resumen <- summary(tema_zona_tukey)
+tema_zona_tukey_labels <- cld(tema_zona_tukey)
+tema_zona_labels <- as.data.frame(tema_zona_tukey_labels$mcletters$Letters)
+tema_zona_labels <- tema_zona_labels |>
+  mutate(ZONA = rownames(tema_zona_labels), .before = 1) |> 
+  rename(tukey_label = `tema_zona_tukey_labels$mcletters$Letters`)
+
+
+q_75_zona <- datos_tema |> 
+  filter(ABR_ENT != "MEX") |> 
+  group_by(ZONA) |> 
+  summarise(q_75 = quantile(VALOR_millones, 0.75, na.rm = TRUE), .groups = "drop")
+
+tema_zona_labels <- tema_zona_labels |> mutate(q_75 = q_75_zona$q_75)
+```
+
+```{r}
+#| code-fold: true
+#| fig-width: 8
+#| fig-height: 6
+#| fig-align: "center"
+
+ggplot(datos_tema |> filter(ABR_ENT != "MEX")) +
+  geom_boxplot(aes(x = ZONA, y = VALOR_millones, fill = ZONA), outlier.color = "red", outlier.size = 1.5, show.legend = FALSE) +
+  geom_label(data = tema_zona_labels,
+    aes(x = ZONA, y = q_75, label = tukey_label),
+    color = "black", size = 5, vjust = -0.3) +
+  labs(
+    title = "Distribución de Egresos/Ingresos por Zona Geográfica (2013-2023)",
+    x = "Zona Geográfica",
+    y = "Egresos/Ingresos (Millones MXN)"
+  ) +
+  scale_fill_manual(values = brewer.pal(n = 6, name = "Set3")[4:6]) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 13, face = "bold"),
+    axis.title = element_text(size = 12)
+  )
+```
+
+## Análisis de Variaciones Porcentuales Interanuales
+
+Se analiza la variación porcentual anual de los egresos/ingresos por estado. Primero se calcula la variación porcentual respecto al año anterior y se muestran las respectivas series temporales.
+
+```{r}
+#| code-fold: true
+
+# Calcular cambios anuales por estado
+datos_cambios <- datos_tema |> 
+  arrange(CVE_ENT, ANIO) |> 
+  group_by(CVE_ENT, NOM_ENT, ABR_ENT) |> 
+  mutate(
+    cambio_absoluto = (VALOR - lag(VALOR)),
+    cambio_porcentual = ((VALOR - lag(VALOR)) / lag(VALOR)) * 100,
+    VALOR_millones = VALOR / 1e6
+  ) |> 
+  ungroup() |> 
+  filter(!is.na(cambio_absoluto))
+
+graf_cambios <- ggplot(datos_cambios, aes(x = ANIO, y = cambio_porcentual, group = ABR_ENT, color = ABR_ENT)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  labs(
+    title = "Variación Porcentual Anual de Egresos/Ingresos por Entidad (2014-2023)",
+    x = "Año",
+    y = "Cambio Porcentual (%)",
+    color = "Entidad"
+  ) +
+  scale_x_continuous(breaks = seq(2014, 2023, by = 1)) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 12),
+    legend.position = "bottom"
+  )
+
+ggplotly(graf_cambios)
+
+```
+
+### Histograma de cambios porcentuales
+
+```{r}
+#| code-fold: true
+#| fig-width: 8
+#| fig-height: 6
+#| fig-align: "center"
+
+# Histograma de cambios porcentuales
+hist_cambios <- ggplot(datos_cambios, aes(x = cambio_porcentual)) +
+  geom_histogram(bins = 30, fill = "steelblue", alpha = 0.7, color = "white") +
+  geom_vline(aes(xintercept = mean(cambio_porcentual, na.rm = TRUE)), 
+             color = "red", linetype = "dashed", linewidth = 1) +
+  geom_vline(aes(xintercept = median(cambio_porcentual, na.rm = TRUE)), 
+             color = "orange", linetype = "dashed", linewidth = 1) +
+  labs(
+    title = "Distribución de Cambios Porcentuales Anuales",
+    subtitle = "Línea roja: media, Línea naranja: mediana",
+    x = "Cambio Porcentual (%)",
+    y = "Frecuencia"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 12)
+  )
+
+print(hist_cambios)
+```
+
+### Estadísticas descriptivas de los cambios porcentuales por estado
+
+```{r}
+#| code-fold: true
+#| message: false
+#| warning: false
+
+# Resumen estadístico de los cambios porcentuales
+estadisticas_cambios <- datos_cambios |> 
+  group_by(CVE_ENT, NOM_ENT, ABR_ENT)  |>
+  summarise(
+    observaciones = n(),
+    media_cambio = mean(cambio_porcentual, na.rm = TRUE),
+    mediana_cambio = median(cambio_porcentual, na.rm = TRUE),
+    desv_cambio = sd(cambio_porcentual, na.rm = TRUE),
+    min_cambio = min(cambio_porcentual, na.rm = TRUE),
+    max_cambio = max(cambio_porcentual, na.rm = TRUE),
+    q25 = quantile(cambio_porcentual, 0.25, na.rm = TRUE),
+    q75 = quantile(cambio_porcentual, 0.75, na.rm = TRUE)
+  )
+
+kable(estadisticas_cambios,
+      col.names = c("CVE", "Entidad", "Abreviatura", "Obs.", "Media", "Mediana", "Desv. Est.",
+                   "Mín.", "Máx.", "Q25", "Q75"),
+      digits = 2,
+      caption = "Resumen Estadístico de Cambios Porcentuales por Estado Anuales (2014-2023)") |> 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), 
+                font_size = 11) |> 
+  scroll_box(height = "500px")
+
+
+```
+
+### Mapa de cambios porcentuales promedio por estado
+
+```{r}
+#| code-fold: true
+#| fig-width: 8
+#| fig-height: 6
+#| fig-align: "center"
+#| message: false
+
+estadisticas_cambios_mapa <- estadisticas_cambios |> 
+  dplyr::select(CVE_ENT, media_cambio)
+estadisticas_cambios_mapa <- left_join(nacional_estado, estadisticas_cambios_mapa, by = "CVE_ENT")
+
+
+mapa <- ggplot(estadisticas_cambios_mapa) +
+  geom_sf(aes(fill=media_cambio), color = "gray50", size = 0.5) +
+  labs(
+    title = "Cambio porcentual anual promedio por estado (2014-2023)",
+    caption = "Fuente: INEGI - Finanzas Públicas",
+    fill = " "
+  ) +
+  scale_fill_viridis_c() +
+  theme_void() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 12),
+    plot.caption = element_text(size = 10)
+  )
+  
+  
+print(mapa)
+```
+
+### Análisis de varianza (ANOVA) de cambios porcentuales por estado
+
+Inicialmente se muestra la distribución de los cambios porcentuales anueales por estado a través de gráficas de cajas.
+
+```{r}
+#| code-fold: true
+#| fig-width: 12
+#| fig-height: 6
+#| fig-align: "center"
+
+ggplot(datos_cambios, aes(x = ABR_ENT, y = cambio_porcentual)) +
+  geom_boxplot(aes(fill = ABR_ENT), outlier.color = "red", outlier.size = 1.5, show.legend = FALSE) +
+  labs(
+    title = "Distribución de cambios porcentuales anuales (2014-2023)",
+    x = "Entidad",
+    y = "Cambio Porcentual (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.title = element_text(size = 12)
+  )
+
+```
+
+Se realiza el análisis de varianza (ANOVA) para determinar si existen diferencias significativas en los cambios porcentuales anuales entre los estados. También se reaplica la prueba post-hoc de comparaciones múltiples de Tukey, aunque en este caso, no hubo diferencias significativas.
+
+```{r}
+#| code-fold: true
+#| fig-width: 12
+#| fig-height: 6
+#| fig-align: "center"
+
+cambio_estado_aov <- aov(cambio_porcentual ~ ABR_ENT, data = datos_cambios)
+#cambio_estado_aov
+#summary(cambio_estado_aov)
+cambio_estado_tukey <- glht(cambio_estado_aov, linfct = mcp(ABR_ENT = "Tukey"))
+#cambio_estado_tukey_resumen <- summary(cambio_estado_tukey)
+#cambio_estado_tukey_labels <- cld(cambio_estado_tukey)
+
+cambio_estado_tukey_resumen <- readRDS("cambio_estado_tukey_labels.rds")
+cambio_estado_tukey_labels <- readRDS("cambio_estado_tukey_labels.rds")
+cambio_estado_labels <- as.data.frame(cambio_estado_tukey_labels$mcletters$Letters)
+cambio_estado_labels <- cambio_estado_labels |>
+  mutate(ABR_ENT = rownames(cambio_estado_labels), .before = 1) |> 
+  rename(tukey_label = `cambio_estado_tukey_labels$mcletters$Letters`)
+
+
+```
+
+### Análisis de varianza (ANOVA) de cambios porcentuales por zona geográfica
+
+A continuación se muestran las gráficas de cajas y densidad de los cambios porcentuales anuales por zona geográfica.
+
+```{r}
+#| code-fold: true
+#| fig-width: 8
+#| fig-height: 6
+#| fig-align: "center"
+
+ggplot(datos_cambios) +
+  geom_boxplot(aes(x = ZONA, y = cambio_porcentual, fill = ZONA), outlier.color = "red", outlier.size = 1.5, show.legend = FALSE) +
+  labs(
+    title = "Distribución de Cambios Porcentuales Anuales por Zona Geográfica (2013-2023)",
+    x = "Zona Geográfica",
+    y = "Cambio Porcentual (%)"
+  ) +
+  scale_fill_manual(values = brewer.pal(n = 6, name = "Set3")[4:6]) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 13, face = "bold"),
+    axis.title = element_text(size = 12)
+  )
+
+```
+
+Se realiza el análisis de varianza (ANOVA) para determinar si existen diferencias significativas en los cambios porcentuales entre las zonas geográficas. También se reaplica la prueba post-hoc de comparaciones múltiples de Tukey, aunque, no hubo diferencias significativas.
+
+```{r}
+#| code-fold: true
+
+cambio_zona_aov <- aov(cambio_porcentual ~ ZONA, data = datos_cambios)
+#cambio_zona_aov
+#summary(cambio_zona_aov)
+cambio_zona_tukey <- glht(cambio_zona_aov, linfct = mcp(ZONA = "Tukey"))
+cambio_zona_tukey_resumen <- summary(cambio_zona_tukey)
+cambio_zona_tukey_labels <- cld(cambio_zona_tukey)
+cambio_zona_labels <- as.data.frame(cambio_zona_tukey_labels$mcletters$Letters)
+cambio_zona_labels <- cambio_zona_labels |>
+  mutate(ZONA = rownames(cambio_zona_labels), .before = 1) |> 
+  rename(tukey_label = `cambio_zona_tukey_labels$mcletters$Letters`)
+```
+
+ANALISIS FRANCISCO VÁZQUEZ MENDOZA
+
+### Tendencias Temporales
+
+```{r}
+#| code-fold: true
+#| fig-width: 10
+#| fig-height: 6
+
+# 1. Pre-procesamiento: Calcular los promedios antes de graficar
+datos_resumen <- egresos_cat_temporal |> 
+  filter(ABR_ENT != "MEX") |> 
+  group_by(ANIO, Categoria_Principal) |> 
+  summarise(
+    Promedio_Valor = mean(VALOR_millones, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# 2. Graficar los datos procesados
+graf_tendencias <- ggplot(datos_resumen, 
+       aes(x = ANIO, y = Promedio_Valor, color = Categoria_Principal)) +
+  # Usamos geom_line y geom_point directos porque ya tenemos los promedios
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2) +
+  labs(
+    title = "Tendencias Temporales por Categoría Principal (2013-2023)",
+    subtitle = "Promedio Estatal (Excluyendo Edo. Méx)",
+    y = "Promedio (Millones MXN)", 
+    x = "Año", 
+    color = "Categoría"
+  ) +
+  # Usamos scale_color_viridis_d para una paleta moderna y accesible
+  scale_color_viridis_d(option = "turbo") + 
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 14)
+  )
+
+ggplotly(graf_tendencias)
+```
+
+### Análisis de Egresos por Categoría Principal
+
+```{r}
+# --- Preparación y Clasificación de Datos (Versión Optimizada) ---
+
+# Definimos patrones de texto previamente para limpiar el 'case_when'
+# (?i) hace que la búsqueda no distinga entre mayúsculas y minúsculas
+regex_corriente <- "(?i)Servicios Personales|Remuneraciones|Materiales|Suministros|Servicios Generales|Transferencias|Subsidios"
+regex_capital   <- "(?i)Bienes|Inversión|Obra"
+regex_deuda     <- "(?i)Deuda"
+
+datos_egresos <- datos |> 
+  filter(TEMA == "Egresos") |> 
+  mutate(
+    # 'parse_number' es más robusto para extraer el ID numérico del texto
+    CAPITULO_ID = parse_number(DESCRIPCION_CATEGORIA),
+    
+    Categoria_Principal = case_when(
+      # 1. Clasificación por Texto (Prioridad)
+      str_detect(DESCRIPCION_CATEGORIA, regex_corriente) ~ "Gasto Corriente",
+      str_detect(DESCRIPCION_CATEGORIA, regex_capital)   ~ "Gasto de Capital",
+      str_detect(DESCRIPCION_CATEGORIA, regex_deuda)     ~ "Deuda Pública",
+      
+      # 2. Clasificación por ID Numérico (Respaldo)
+      # Capítulos 1000-4000 suelen ser Gasto Corriente
+      between(CAPITULO_ID, 1000, 4999) ~ "Gasto Corriente", 
+      # Capítulos 5000-6000 suelen ser Capital
+      between(CAPITULO_ID, 5000, 6999) ~ "Gasto de Capital",
+      # Capítulo 9000 es Deuda
+      CAPITULO_ID >= 9000              ~ "Deuda Pública",
+      
+      # 3. Todo lo demás
+      TRUE ~ "Otros Egresos"
+    )
+  )
+
+# --- Agrupación y Sumarización ---
+
+egresos_cat_temporal <- datos_egresos |> 
+  group_by(ANIO, CVE_ENT, ABR_ENT, ZONA, Categoria_Principal) |> 
+  summarise(
+    VALOR = sum(VALOR, na.rm = TRUE),
+    # Calculamos los millones aquí mismo para ahorrar un paso
+    VALOR_millones = sum(VALOR, na.rm = TRUE) / 1e6,
+    .groups = "drop"
+  )
+```
+
+### ANOVA por Categorías Principales
+
+```{r}
+#| code-fold: true
+#| fig-width: 10
+#| fig-height: 6
+
+# 1. Ajuste del Modelo
+data_anova <- egresos_cat_temporal |> 
+  filter(Categoria_Principal == "Gasto Corriente", ABR_ENT != "MEX")
+
+modelo_anova <- aov(VALOR_millones ~ ZONA, data = data_anova)
+tukey_res    <- TukeyHSD(modelo_anova)
+
+# 2. Convertir resultados a formato 'tidy' para graficar
+# Usamos broom::tidy para extraer los datos del objeto Tukey limpiamente
+tukey_df <- broom::tidy(tukey_res) |> 
+  mutate(
+    es_significativo = adj.p.value < 0.05
+  )
+
+# 3. Visualización mejorada con ggplot2
+graf_tukey <- ggplot(tukey_df, aes(y = contrast, x = estimate, color = es_significativo)) +
+  # Línea vertical en 0 (si el intervalo la cruza, no hay diferencia significativa)
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  
+  # Intervalos de confianza
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2, linewidth = 1) +
+  
+  # Puntos de estimación media
+  geom_point(size = 3) +
+  
+  # Personalización de colores y etiquetas
+  scale_color_manual(values = c("gray70", "#D55E00"), 
+                     labels = c("No Significativo", "Significativo (p < 0.05)")) +
+  labs(
+    title = "Diferencias en Gasto Corriente por Zona (Prueba Tukey)",
+    subtitle = "Comparación de medias con Intervalos de Confianza del 95%",
+    x = "Diferencia de Medias (Millones MXN)",
+    y = "Comparación entre Zonas",
+    color = "Resultado"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text.y = element_text(size = 11, face = "bold")
+  )
+
+# Mostrar gráfico
+print(graf_tukey)
+
+# Opcional: Mostrar tabla con valores exactos
+# tukey_df |> select(contrast, estimate, adj.p.value) |> kable()
+```
+
+### Análisis de Servicios Personales
+
+```{r}
+#| code-fold: true
+#| fig-width: 10
+#| fig-height: 6
+
+library(scales) # Para formatear los ejes
+
+# 1. Preparación de datos (Más robusta)
+servicios_personales <- datos_egresos |> 
+  # Buscamos específicamente el Capítulo 1000 o la cadena de texto
+  filter(str_detect(DESCRIPCION_CATEGORIA, regex("Servicios Personales|Remuneraciones", ignore_case = TRUE))) |> 
+  group_by(ANIO, ABR_ENT, ZONA) |> 
+  summarise(
+    VALOR_millones = sum(VALOR, na.rm = TRUE) / 1e6, 
+    .groups = "drop"
+  )
+
+# 2. Visualización Mejorada
+graf_servicios <- ggplot(servicios_personales |> filter(ABR_ENT != "MEX"), 
+       aes(x = ZONA, y = VALOR_millones, fill = ZONA)) +
+  
+  # A. Capa de puntos (Jitter) para ver la distribución real de los estados
+  geom_jitter(color = "gray40", alpha = 0.3, width = 0.2, size = 1.5) +
+  
+  # B. Boxplot (con transparencia para ver los puntos detrás)
+  geom_boxplot(outlier.colour = "red", outlier.shape = 16, outlier.size = 3, alpha = 0.8) +
+  
+  # C. Indicador de la Media (Rombo blanco)
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 3, 
+               fill = "white", color = "black") +
+  
+  # D. Estética y Etiquetas
+  scale_fill_brewer(palette = "Set3") + # O usa scale_fill_viridis_d() si prefieres
+  scale_y_continuous(labels = label_comma()) + # Formato 1,000, 2,000...
+  labs(
+    title = "Distribución de Servicios Personales por Zona (2013-2023)", 
+    subtitle = "Capítulo 1000 (Nómina) - Excluyendo Edo. Méx.\n(Rombo blanco = Promedio)", 
+    y = "Millones MXN",
+    x = "Zona Geográfica",
+    fill = "Zona"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none", # No necesitamos leyenda si el eje X ya lo dice
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(color = "gray30"),
+    axis.text.x = element_text(size = 11, face = "bold")
+  )
+
+print(graf_servicios)
+```
+
+Al analizar la distribución, vemos que la ubicación geográfica sí importa. El **Norte** se comporta de manera muy estable (la caja es pequeña), lo que sugiere control o similitud económica. En cambio, el **Centro** es la zona más desigual: conviven estados con nóminas austeras y otros con gastos enormes. Por último, llama la atención el **Sur**, donde la mayoría se mantiene en el promedio, pero existen casos atípicos que disparan el gasto muy por encima de la tendencia general.
+
+### 
+
+### Matriz de Correlación entre Categorías de Egresos
+
+```{r}
+#| code-fold: true
+#| fig-width: 8
+#| fig-height: 8
+
+library(corrplot)
+library(tibble) # Para column_to_rownames
+
+# 1. Preparación de la Matriz
+datos_corr <- egresos_cat_temporal |> 
+  filter(ABR_ENT != "MEX") |> # Importante: Excluir el total nacional para no sesgar
+  group_by(ABR_ENT, Categoria_Principal) |> 
+  summarise(VALOR = mean(VALOR_millones, na.rm = TRUE), .groups = "drop") |> 
+  pivot_wider(names_from = Categoria_Principal, values_from = VALOR, values_fill = 0) |> 
+  # Convertimos la columna de texto en nombres de fila
+  column_to_rownames(var = "ABR_ENT") 
+
+# 2. Cálculos Estadísticos
+M <- cor(datos_corr, use = "pairwise.complete.obs") # Ignora NAs de forma segura
+test_res <- cor.mtest(datos_corr, conf.level = 0.95) # Calcula p-values
+
+# 3. Visualización Profesional
+corrplot(M, 
+         method = "ellipse", 
+         type = "upper", 
+         
+         # Ordenar variables por similitud (Clustering)
+         order = "hclust", 
+         addrect = 2, # Dibuja recuadros alrededor de los clusters
+         
+         # Estética de etiquetas y coeficientes
+         addCoef.col = "black", # Mostrar números
+         number.cex = 0.8,      # Tamaño de números
+         tl.col = "black",      # Color de texto
+         tl.srt = 45,           # Rotación de texto
+         
+         # Manejo de Significancia Estadística
+         p.mat = test_res$p,    # Matriz de p-values
+         sig.level = 0.05,      # Nivel de confianza
+         insig = "blank",       # Ocultar coeficientes no significativos (o usar "pch" para tacharlos)
+         
+         # Colores
+         col = COL2('RdBu', 10), # Paleta Rojo-Azul (Estándar académico)
+         diag = FALSE,
+         title = "Correlación de Egresos Estatales (Promedio Anual)", 
+         mar = c(0,0,2,0))
+```
+
+Este gráfico nos cuenta una historia sobre la estructura del dinero estatal. Primero, vemos una **fuerte inercia presupuestal**: el *Gasto Corriente*, *Gasto de Capital* y *Otros Egresos* se mueven casi al unísono (elipses delgadas y azul oscuro). Esto es lógico: los estados grandes tienen más presupuesto para todo, y los pequeños, menos.
+
+### Varianza explicada y Biplot PCA
+
+```{r}
+#| code-fold: true
+#| fig-width: 10
+#| fig-height: 12
+
+library(ggrepel) # Indispensable para que las etiquetas no se solapen
+
+# 1. Preparación de Datos para PCA
+# Usamos 'egresos_wide' o pivotamos 'egresos_cat_temporal'
+pca_data <- egresos_cat_temporal |> 
+  filter(ABR_ENT != "MEX") |> # Excluir total nacional
+  group_by(ABR_ENT, Categoria_Principal) |> 
+  summarise(VALOR = mean(VALOR_millones, na.rm = TRUE), .groups = "drop") |> 
+  pivot_wider(names_from = Categoria_Principal, values_from = VALOR, values_fill = 0) |> 
+  column_to_rownames("ABR_ENT")
+
+# 2. Cálculo de PCA
+pca_res <- prcomp(pca_data, scale. = TRUE)
+
+# --- GRÁFICO 1: SCREE PLOT MEJORADO ---
+var_exp <- pca_res$sdev^2 / sum(pca_res$sdev^2)
+scree_data <- tibble(
+  PC = factor(paste0("PC", 1:length(var_exp)), levels = paste0("PC", 1:length(var_exp))), 
+  Varianza = var_exp,
+  Label = percent(var_exp, accuracy = 0.1) # Etiqueta con %
+)
+
+graf_scree <- ggplot(scree_data, aes(x = PC, y = Varianza)) + 
+  geom_col(fill = "#2C3E50", alpha = 0.8) + # Color elegante
+  geom_line(aes(group = 1), color = "#E74C3C", linewidth = 1) + 
+  geom_point(color = "#E74C3C", size = 2) +
+  geom_text(aes(label = Label), vjust = -0.5, fontface = "bold", size = 3.5) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Scree Plot: Varianza Explicada por Componente", 
+       y = "% de Varianza Explicada", x = NULL) + 
+  theme_minimal()
+
+# --- GRÁFICO 2: BIPLOT OPTIMIZADO ---
+
+# Extracción de coordenadas
+pca_vars <- as.data.frame(pca_res$rotation)
+pca_vars$Var <- rownames(pca_vars)
+pca_ind <- as.data.frame(pca_res$x)
+pca_ind$Est <- rownames(pca_ind)
+
+# CÁLCULO DEL FACTOR DE ESCALA (Para que flechas y puntos se vean bien juntos)
+# Esto reemplaza el "*5" manual. Escala las flechas al rango de los datos.
+mult <- min(
+  (max(pca_ind$PC2) - min(pca_ind$PC2)/(max(pca_vars$PC2)-min(pca_vars$PC2))),
+  (max(pca_ind$PC1) - min(pca_ind$PC1)/(max(pca_vars$PC1)-min(pca_vars$PC1)))
+) * 0.8
+
+# Ajustamos las flechas con el multiplicador
+pca_vars <- pca_vars |> mutate(v1 = PC1 * mult, v2 = PC2 * mult)
+
+graf_biplot <- ggplot() +
+  # A. Puntos de los Estados (Individuos)
+  geom_point(data = pca_ind, aes(x = PC1, y = PC2), 
+             color = "gray60", size = 2, alpha = 0.6) +
+  
+  # B. Etiquetas de Estados (Con ggrepel para evitar encimamientos)
+  geom_text_repel(data = pca_ind, aes(x = PC1, y = PC2, label = Est), 
+                  size = 3, color = "black", max.overlaps = 20) +
+  
+  # C. Flechas de Variables (Vectores)
+  geom_segment(data = pca_vars, aes(x = 0, y = 0, xend = v1, yend = v2), 
+               arrow = arrow(length = unit(0.3, "cm")), 
+               color = "#D35400", linewidth = 1) +
+  
+  # D. Etiquetas de Variables
+  geom_text(data = pca_vars, aes(x = v1 * 1.15, y = v2 * 1.15, label = Var), 
+            color = "#D35400", fontface = "bold", size = 4) +
+  
+  # Estética
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray80") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray80") +
+  labs(title = "Biplot PCA: Estructura de Egresos", 
+       subtitle = paste0("PC1 (", scree_data$Label[1], ") vs PC2 (", scree_data$Label[2], ")"),
+       x = paste0("Componente 1"), 
+       y = paste0("Componente 2")) + 
+  theme_minimal()
+
+# Mostrar ambos gráficos
+print(graf_scree)
+print(graf_biplot)
+```
+
+Este mapa nos permite clasificar a los estados según su 'personalidad financiera'. El eje horizontal (PC1) actúa como una **regla de magnitud**: hacia la derecha están los estados con presupuestos masivos (Jalisco, Puebla, Veracruz) y hacia la izquierda los de presupuestos modestos (Colima, Tlaxcala).
+
+## Modelo de Regresión Lineal: Ingresos vs Egresos
+
+```{r}
+#| code-fold: true
+#| message: false
+#| warning: false
+#| fig-width: 10
+#| fig-height: 7
+
+library(broom)   # Para manejar modelos de forma ordenada
+library(ggrepel) # Para etiquetas que no se enciman
+
+# 1. Preparación de Datos
+datos_regresion <- datos |> 
+  filter(CATEGORIA == "Tema", ABR_ENT != "MEX") |> # Mantenemos exclusión de EdoMex
+  dplyr::select(ANIO, CVE_ENT, ABR_ENT, TEMA, VALOR) |> 
+  pivot_wider(names_from = TEMA, values_from = VALOR, values_fill = 0) |> 
+  mutate(
+    Ingresos_mill = Ingresos / 1e6,
+    Egresos_mill = Egresos / 1e6
+  )
+
+# 2. Ajuste del Modelo Lineal
+modelo_lm <- lm(Egresos_mill ~ Ingresos_mill, data = datos_regresion)
+
+# 3. Diagnóstico y Enriquecimiento (Añadimos residuos a los datos)
+# 'augment' añade columnas como .fitted (predicción) y .resid (residuo)
+datos_modelo <- augment(modelo_lm, datos_regresion) |> 
+  mutate(
+    # Identificamos estados "interesantes" (Residuo estandarizado > 2 o < -2)
+    es_outlier = abs(.std.resid) > 2,
+    Label = ifelse(es_outlier, as.character(ABR_ENT), "")
+  )
+
+# Extraer métricas para el gráfico
+glance_metrics <- glance(modelo_lm)
+coefs <- tidy(modelo_lm)
+ecuacion <- paste0("y = ", round(coefs$estimate[1], 2), " + ", 
+                   round(coefs$estimate[2], 2), "x")
+
+# 4. Visualización Avanzada
+ggplot(datos_modelo, aes(x = Ingresos_mill, y = Egresos_mill)) +
+  
+  # A. Línea de Regresión e Intervalo de Confianza
+  geom_smooth(method = "lm", color = "#E74C3C", fill = "#E74C3C", alpha = 0.15) +
+  
+  # B. Puntos (Coloreados por magnitud del residuo)
+  geom_point(aes(color = abs(.resid)), alpha = 0.7, size = 2) +
+  
+  # C. Etiquetas para Outliers (Estados que gastan más/menos de lo esperado)
+  geom_text_repel(aes(label = Label), size = 3, max.overlaps = 20, 
+                  box.padding = 0.5, fontface = "bold", color = "black") +
+  
+  # D. Anotaciones con Estadísticas
+  annotate("text", x = min(datos_modelo$Ingresos_mill), y = max(datos_modelo$Egresos_mill), 
+           label = paste0("Ecuación: ", ecuacion, "\n",
+                          "R² ajustado: ", round(glance_metrics$adj.r.squared, 4)),
+           hjust = 0, vjust = 1, fontface = "italic", size = 4, color = "gray20") +
+  
+  # E. Estética
+  scale_color_viridis_c(option = "magma", direction = -1, name = "Desviación\n(Residuo)") +
+  scale_x_continuous(labels = scales::label_comma()) +
+  scale_y_continuous(labels = scales::label_comma()) +
+  labs(
+    title = "Regresión Lineal: Ingresos vs Egresos Estatales",
+    subtitle = "Estados etiquetados muestran desviación significativa del modelo (Outliers)",
+    x = "Ingresos Totales (Millones MXN)",
+    y = "Egresos Totales (Millones MXN)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+# 5. Tabla de Coeficientes (Opcional para el reporte)
+# coefs |> select(term, estimate, std.error, p.value) |> kable(digits = 4)
+```
+
+esta gráfica sirve principalmente como una **validación de calidad de los datos**:
+
+## Verificación de Supuestos
+
+```{r}
+#| code-fold: true
+#| fig-width: 12
+#| fig-height: 5
+#| layout-ncol: 2
+#| warning: false
+
+library(broom)
+
+# 1. Preparar datos de diagnóstico
+# 'augment' añade columnas .resid (residuales) y .fitted (predichos) automáticamente
+datos_diag <- augment(modelo_lm)
+
+# 2. Gráfico A: Histograma con Curva Normal
+graf_hist <- ggplot(datos_diag, aes(x = .resid)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30, 
+                 fill = "#3498DB", color = "white", alpha = 0.7) +
+  stat_function(fun = dnorm, 
+                args = list(mean = mean(datos_diag$.resid), 
+                            sd = sd(datos_diag$.resid)), 
+                color = "#E74C3C", linewidth = 1.2) +
+  labs(title = "Distribución de los Residuales",
+       subtitle = "Histograma vs Curva Normal Teórica",
+       x = "Valor del Residual", y = "Densidad") +
+  theme_minimal()
+
+# 3. Gráfico B: Q-Q Plot (Normalidad)
+graf_qq <- ggplot(datos_diag, aes(sample = .resid)) +
+  geom_qq(color = "gray40", alpha = 0.6, size = 2) +
+  geom_qq_line(color = "#E74C3C", linewidth = 1.2) +
+  labs(title = "Gráfico Q-Q Normal",
+       subtitle = "Evaluación de ajuste a la línea diagonal",
+       x = "Cuantiles Teóricos", y = "Cuantiles de la Muestra") +
+  theme_minimal()
+
+# Imprimir gráficos (Quarto los pondrá lado a lado por la opción layout-ncol: 2)
+print(graf_hist)
+print(graf_qq)
+```
+
+Conclusiones
+
+El análisis estadístico del periodo 2013-2023 evidencia una estructura de finanzas públicas dominada por el gasto operativo, donde la visualización de **diagramas de caja** permitió identificar disparidades regionales críticas, específicamente valores atípicos en la nómina de la Zona Sur que contrastan con la homogeneidad del Norte. A nivel estructural, la **matriz de correlación** y el **PCA** revelaron que, aunque el tamaño del presupuesto es el principal diferenciador (efecto escala), existe una dicotomía cualitativa clara: mientras algunos estados del Centro priorizan la inversión de capital, otros, principalmente en el Norte, se agrupan en torno al endeudamiento, demostrando que la deuda no necesariamente financia la infraestructura. Finalmente, la validación del modelo de **regresión lineal** con un ajuste perfecto ($R^2=1$) y el diagnóstico de **residuales normales** confirman la robustez contable de la base de datos, ratificando matemáticamente el estricto apego al principio de equilibrio presupuestario donde el egreso se ajusta de manera determinística al ingreso disponible.
